@@ -50,9 +50,13 @@ typedef struct {
 	resolve_event_func_t resolver;
 	event_lister_func_t lister;
 	unsigned int backend;
+	event_getter_raw_func_t getter_raw;
 	event_getter_func_t getter;
 } known_event_t;
 
+
+#define TIMESPEC_TO_NANOS(val) ((val).tv_sec * 1000 * 1000 * 1000 + (val).tv_nsec)
+#define TIMEVAL_TO_MICROS(val) ((val).tv_sec * 1000 * 1000 + (val).tv_usec)
 
 int ubench_event_init(void) {
 #ifdef HAS_QUERY_PERFORMANCE_COUNTER
@@ -82,8 +86,21 @@ static long long timestamp_diff_ns(const timestamp_t *a, const timestamp_t *b) {
 #endif
 }
 
-static long long getter_wall_clock_time(const benchmark_run_t *bench, const ubench_event_info_t *UNUSED_PARAMETER(info)) {
-	return timestamp_diff_ns(&bench->start.timestamp, &bench->end.timestamp);
+static long long getter_wall_clock_time(const ubench_events_snapshot_t *start, const ubench_events_snapshot_t *end, const ubench_event_info_t *UNUSED_PARAMETER(info)) {
+	return timestamp_diff_ns(&start->timestamp, &end->timestamp);
+}
+
+static long long getter_raw_wall_clock_time(const ubench_events_snapshot_t *value, const ubench_event_info_t *UNUSED_PARAMETER(info)) {
+#ifdef HAS_TIMESPEC
+	return TIMESPEC_TO_NANOS(value->timestamp);
+#elif defined(HAS_QUERY_PERFORMANCE_COUNTER)
+	if (windows_timer_frequency.QuadPart == 0) {
+		return -1;
+	}
+	return value->timestamp.QuadPart * 1000 * 1000 * 1000 / windows_timer_frequency.QuadPart;
+#else
+	return value->timestamp;
+#endif
 }
 
 #ifdef HAS_GET_THREAD_TIMES
@@ -91,29 +108,52 @@ static long long get_filetime_diff_in_us(const FILETIME *a, const FILETIME *b) {
   long long result = ((LARGE_INTEGER*)b)->QuadPart - ((LARGE_INTEGER*)a)->QuadPart;
   return result / 10;
 }
+
+static long long get_filetime_in_us(const FILETIME *val) {
+	return (((LARGE_INTEGER*)val)->QuadPart) / 10;
+}
 #endif
 
-static long long getter_thread_time(const benchmark_run_t *bench, const ubench_event_info_t *UNUSED_PARAMETER(info)) {
+static long long getter_thread_time(const ubench_events_snapshot_t *start, const ubench_events_snapshot_t *end, const ubench_event_info_t *UNUSED_PARAMETER(info)) {
 #ifdef HAS_TIMESPEC
-	long long result = timespec_diff_as_ns(&bench->start.threadtime, &bench->end.threadtime);
+	long long result = timespec_diff_as_ns(&start->threadtime, &end->threadtime);
 	// fprintf(stderr, "getter_thread_time(%lld:%lld, %lld:%lld) = %lld\n", (long long) bench->start.threadtime.tv_sec, (long long) bench->start.threadtime.tv_nsec, (long long) bench->end.threadtime.tv_sec, (long long) bench->end.threadtime.tv_nsec, result);
 	return result;
 #elif defined(HAS_GET_THREAD_TIMES)
-  long long kernel_us = get_filetime_diff_in_us(&bench->start.threadtime.kernel, &bench->end.threadtime.kernel);
-  long long user_us = get_filetime_diff_in_us(&bench->start.threadtime.user, &bench->end.threadtime.user);
+  long long kernel_us = get_filetime_diff_in_us(&start->threadtime.kernel, &end->threadtime.kernel);
+  long long user_us = get_filetime_diff_in_us(&start->threadtime.user, &end->threadtime.user);
   return (user_us + kernel_us) * 1000;
 #else
 	return 0;
 #endif
 }
 
-static long long getter_jvm_compilations(const benchmark_run_t *bench, const ubench_event_info_t *UNUSED_PARAMETER(info)) {
-	return bench->end.compilations - bench->start.compilations;
+static long long getter_raw_thread_time(const ubench_events_snapshot_t *value, const ubench_event_info_t *UNUSED_PARAMETER(info)) {
+#ifdef HAS_TIMESPEC
+	return value->threadtime.tv_sec * 1000 * 1000 * 1000 + value->threadtime.tv_nsec;
+#elif defined(HAS_GET_THREAD_TIMES)
+	return (get_filetime_in_us(&value->threadtime.kernel) + get_filetime_in_us(&value->threadtime.user)) * 1000;
+#else
+	return 0;
+#endif
 }
 
+static long long getter_jvm_compilations(const ubench_events_snapshot_t *start, const ubench_events_snapshot_t *end, const ubench_event_info_t *UNUSED_PARAMETER(info)) {
+	return end->compilations - start->compilations;
+}
+
+static long long getter_raw_jvm_compilations(const ubench_events_snapshot_t *value, const ubench_event_info_t *UNUSED_PARAMETER(info)) {
+	return value->compilations;
+}
+
+
 #ifdef HAS_GETRUSAGE
-static long long getter_context_switch_forced(const benchmark_run_t *bench, const ubench_event_info_t *UNUSED_PARAMETER(info)) {
-	return bench->end.resource_usage.ru_nivcsw - bench->start.resource_usage.ru_nivcsw;
+static long long getter_context_switch_forced(const ubench_events_snapshot_t *start, const ubench_events_snapshot_t *end, const ubench_event_info_t *UNUSED_PARAMETER(info)) {
+	return end->resource_usage.ru_nivcsw - start->resource_usage.ru_nivcsw;
+}
+
+static long long getter_raw_context_switch_forced(const ubench_events_snapshot_t *value, const ubench_event_info_t *UNUSED_PARAMETER(info)) {
+	return value->resource_usage.ru_nivcsw;
 }
 
 static inline long long timeval_diff_as_us(const struct timeval *a, const struct timeval *b) {
@@ -124,31 +164,47 @@ static inline long long timeval_diff_as_us(const struct timeval *a, const struct
 	return sec_diff * 1000 * 1000 + usec_diff;
 }
 
-static long long getter_thread_time_rusage(const benchmark_run_t *bench, const ubench_event_info_t *UNUSED_PARAMETER(info)) {
-	long long user_us = timeval_diff_as_us(&bench->start.resource_usage.ru_utime, &bench->end.resource_usage.ru_utime);
-	long long system_us = timeval_diff_as_us(&bench->start.resource_usage.ru_stime, &bench->end.resource_usage.ru_stime);
+static long long getter_thread_time_rusage(const ubench_events_snapshot_t *start, const ubench_events_snapshot_t *end, const ubench_event_info_t *UNUSED_PARAMETER(info)) {
+	long long user_us = timeval_diff_as_us(&start->resource_usage.ru_utime, &end->resource_usage.ru_utime);
+	long long system_us = timeval_diff_as_us(&start->resource_usage.ru_stime, &end->resource_usage.ru_stime);
+	return (user_us + system_us) * (long long) 1000;
+}
+
+static long long getter_raw_thread_time_rusage(const ubench_events_snapshot_t *value, const ubench_event_info_t *UNUSED_PARAMETER(info)) {
+	long long user_us = TIMEVAL_TO_MICROS(value->resource_usage.ru_utime);
+	long long system_us = TIMEVAL_TO_MICROS(value->resource_usage.ru_stime);
 	return (user_us + system_us) * (long long) 1000;
 }
 
 #endif
 
 #ifdef HAS_PAPI
-static long long getter_papi(const benchmark_run_t *bench, const ubench_event_info_t *info) {
-	if (bench->start.papi_rc1 != PAPI_OK) {
-		return bench->start.papi_rc1;
-	} else if (bench->start.papi_rc2 != PAPI_OK) {
-		return bench->start.papi_rc2;
-	} else if (bench->end.papi_rc1 != PAPI_OK) {
-		return bench->end.papi_rc1;
+static long long getter_papi(const ubench_events_snapshot_t *start, const ubench_events_snapshot_t *end, const ubench_event_info_t *info) {
+	if (start->papi_rc1 != PAPI_OK) {
+		return start->papi_rc1;
+	} else if (start->papi_rc2 != PAPI_OK) {
+		return start->papi_rc2;
+	} else if (end->papi_rc1 != PAPI_OK) {
+		return end->papi_rc1;
 	}
 
-	long long result = bench->end.papi_events[info->papi_index] - bench->start.papi_events[info->papi_index];
+	long long result = end->papi_events[info->papi_index] - start->papi_events[info->papi_index];
 	if (result < 0) {
 		// FIXME: can this happen?
 		return result;
 	} else {
 		return result;
 	}
+}
+
+static long long getter_raw_papi(const ubench_events_snapshot_t *value, const ubench_event_info_t *info) {
+	if (value->papi_rc1 != PAPI_OK) {
+		return value->papi_rc1;
+	} else if (value->papi_rc2 != PAPI_OK) {
+		return value->papi_rc2;
+	}
+
+	return value->papi_events[info->papi_index];
 }
 
 static int resolve_papi_event(const char *name, ubench_event_info_t *info) {
@@ -240,6 +296,7 @@ static known_event_t known_events[] = {
 		.resolver = NULL,
 		.lister = NULL,
 		.backend = UBENCH_EVENT_BACKEND_JVM_COMPILATIONS,
+		.getter_raw = getter_raw_jvm_compilations,
 		.getter = getter_jvm_compilations
 	},
 	{
@@ -248,6 +305,7 @@ static known_event_t known_events[] = {
 		.resolver = NULL,
 		.lister = NULL,
 		.backend = UBENCH_EVENT_BACKEND_SYS_WALLCLOCK,
+		.getter_raw = getter_raw_wall_clock_time,
 		.getter = getter_wall_clock_time
 	},
 #ifdef HAS_GETRUSAGE
@@ -257,6 +315,7 @@ static known_event_t known_events[] = {
 		.resolver = NULL,
 		.lister = NULL,
 		.backend = UBENCH_EVENT_BACKEND_RESOURCE_USAGE,
+		.getter_raw = getter_raw_context_switch_forced,
 		.getter = getter_context_switch_forced
 	},
 #endif
@@ -269,6 +328,7 @@ static known_event_t known_events[] = {
 		.resolver = NULL,
 		.lister = NULL,
 		.backend = UBENCH_EVENT_BACKEND_JVM_COMPILATIONS,
+		.getter_raw = getter_raw_jvm_compilations,
 		.getter = getter_jvm_compilations
 	},
 #ifdef HAS_PAPI
@@ -278,6 +338,7 @@ static known_event_t known_events[] = {
 		.resolver = resolve_papi_event_with_prefix,
 		.lister = list_papi_events,
 		.backend = UBENCH_EVENT_BACKEND_PAPI,
+		.getter_raw = getter_raw_papi,
 		.getter = getter_papi
 	},
 #endif
@@ -288,6 +349,7 @@ static known_event_t known_events[] = {
 		.resolver = NULL,
 		.lister = NULL,
 		.backend = UBENCH_EVENT_BACKEND_RESOURCE_USAGE,
+		.getter_raw = getter_raw_context_switch_forced,
 		.getter = getter_context_switch_forced
 	},
 #endif
@@ -297,6 +359,7 @@ static known_event_t known_events[] = {
 		.resolver = NULL,
 		.lister = NULL,
 		.backend = UBENCH_EVENT_BACKEND_SYS_THREADTIME,
+		.getter_raw = getter_raw_thread_time,
 		.getter = getter_thread_time
 	},
 #ifdef HAS_GETRUSAGE
@@ -306,6 +369,7 @@ static known_event_t known_events[] = {
 		.resolver = NULL,
 		.lister = NULL,
 		.backend = UBENCH_EVENT_BACKEND_RESOURCE_USAGE,
+		.getter_raw = getter_raw_thread_time_rusage,
 		.getter = getter_thread_time_rusage
 	},
 #endif
@@ -315,6 +379,7 @@ static known_event_t known_events[] = {
 		.resolver = NULL,
 		.lister = NULL,
 		.backend = UBENCH_EVENT_BACKEND_SYS_WALLCLOCK,
+		.getter_raw = getter_raw_wall_clock_time,
 		.getter = getter_wall_clock_time
 	},
 #ifdef HAS_PAPI
@@ -324,6 +389,7 @@ static known_event_t known_events[] = {
 		.resolver = resolve_papi_event,
 		.lister = NULL,
 		.backend = UBENCH_EVENT_BACKEND_PAPI,
+		.getter_raw = getter_raw_papi,
 		.getter = getter_papi
 	},
 #endif
@@ -332,6 +398,7 @@ static known_event_t known_events[] = {
 		.resolver = NULL,
 		.lister = NULL,
 		.backend = 0,
+		.getter_raw = NULL,
 		.getter = NULL
 	}
 };
@@ -356,6 +423,7 @@ int ubench_event_resolve(const char *event, ubench_event_info_t *info) {
 			}
 		}
 		info->backend = it->backend;
+		info->op_get_raw = it->getter_raw;
 		info->op_get = it->getter;
 		info->name = ubench_str_dup(event);
 		return 1;
